@@ -14,6 +14,7 @@
 #include <afsconfig.h>
 #include <afs/param.h>
 
+#include <search.h>
 #include <roken.h>
 
 #ifdef AFS_NT40_ENV
@@ -23,6 +24,20 @@
 #endif
 
 #include "afsutil.h"
+
+#define MAX_SERVER_NAMES 255
+#define SERVER_NAME_TTL 20
+
+static struct site *serverNameCacheIPv4 = NULL;
+static struct site *serverNameCacheIPv6 = NULL;
+static int numServerNames = 0;
+
+struct site {
+    void *address;
+    time_t expires;
+    char *name;
+    sa_family_t family;
+};
 
 /* also parse a.b.c.d addresses */
 struct hostent *
@@ -113,6 +128,125 @@ hostutil_GetNameByINet(afs_uint32 addr)
 		(int)(addr & 0xff));
     }
 
+    return tbuffer;
+}
+
+void*
+init_site(struct site *s, void *addr, sa_family_t family)
+{
+    memset(s, 0, sizeof(struct site));
+    if (family == AF_INET) {
+    	if ((s->address = calloc(1, sizeof(afs_uint32))) == NULL)
+            goto done;
+    	*(afs_uint32 *)s->address = *(afs_uint32 *)addr;
+    	s->family = family;
+    } else {
+    	if ((s->address = calloc(16, sizeof(char))) == NULL)
+            goto done;
+    	memcpy(s->address, addr, 16);
+    	s->family = family;
+    }
+    s->name = NULL;
+
+  done:
+    return s->address;
+}
+
+static int
+CompareAddressesIPv4(const void *sa, const void *sb)
+{
+    afs_uint32 a = *(int *)((struct site *)sa)->address;
+    afs_uint32 b = *(int *)((struct site *)sb)->address;
+
+    if (a < b) {
+        return -1;
+    }
+    if (a > b) {
+        return 1;
+    }
+    return 0;
+}
+
+static int
+CompareAddressesIPv6(const void *sa, const void *sb)
+{
+    struct site *sa_t = (struct site *)sa;
+    struct site *sb_t = (struct site *)sb;
+
+    return memcmp(sa_t->address, sb_t->address, 16);
+}
+
+char*
+hostutil_GetNameByINetIPv6(void *addr, sa_family_t family)
+{
+    struct sockaddr_in sa4;
+    struct sockaddr_in6 sa6;
+    static char tbuffer[256];
+    struct site *s = NULL;
+    struct site key;
+    time_t now = time(NULL);
+    void *node;
+
+    memset(&sa4, 0, sizeof(struct sockaddr_in));
+    memset(&sa6, 0, sizeof(struct sockaddr_in6));
+    memset(tbuffer, 0, 256);
+
+    if (init_site(&key, addr, family) == NULL)
+        goto done;
+
+    node = (family == AF_INET) ? tfind(&key, (void *)&serverNameCacheIPv4, CompareAddressesIPv4)
+        : tfind(&key, (void *)&serverNameCacheIPv6, CompareAddressesIPv6);
+    free(key.address);
+
+    if (node) {
+    	s = *(struct site **)node;
+    	if (now < s->expires) {
+    	    return s->name;
+    	}
+    }
+
+    if (family == AF_INET) {
+    	sa4.sin_family = family;
+    	sa4.sin_addr.s_addr = *(afs_uint32 *)addr;
+    	if (getnameinfo((struct sockaddr *)&sa4, sizeof(sa4), tbuffer, sizeof(tbuffer), NULL, 0, 0))
+    	    goto done;
+    } else {
+    	sa6.sin6_family = family;
+    	memcpy(&sa6.sin6_addr.s6_addr, (char *)addr, 16);
+    	if (getnameinfo((struct sockaddr *)&sa6, sizeof(sa6), tbuffer, sizeof(tbuffer), NULL, 0, 0))
+    	    goto done;
+    }
+
+    if (s) {
+    	if (strcmp(tbuffer, s->name) != 0) {
+    	    free(s->name);
+    	    s->name = strdup(tbuffer);
+    	}
+    	s->expires = now + SERVER_NAME_TTL;
+    } else if (numServerNames < MAX_SERVER_NAMES) {
+    	s = calloc(1, sizeof(struct site));
+
+    	if (s == NULL)
+    	    goto done;
+
+    	if (init_site(s, addr, family) == NULL)
+            goto done;
+    	s->expires = now + SERVER_NAME_TTL;
+    	s->name = strdup(tbuffer);
+
+    	if (s->name == NULL) {
+            free(s->address);
+    	    free(s);
+    	    goto done;
+    	}
+
+        if (family == AF_INET)
+            tsearch(s, (void *)&serverNameCacheIPv4, CompareAddressesIPv4);
+        else
+            tsearch(s, (void *)&serverNameCacheIPv6, CompareAddressesIPv6);
+    	numServerNames++;
+    }
+  done:
     return tbuffer;
 }
 
